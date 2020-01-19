@@ -1,0 +1,12 @@
+[package]
+name = "rga-split"
+version = "0.1.0"
+authors = ["Cyberduc-k <tttymo@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+
+
+[[bin]]
+name = "test"
+path = "test/main.rs"
