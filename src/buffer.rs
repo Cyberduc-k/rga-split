@@ -10,7 +10,7 @@ type LamportTimeStamp = usize;
 
 pub struct Buffer {
     pub replica_id: ReplicaId,
-    pub version: Version,
+    pub version: Arc<Version>,
     id: BufferId,
     next_replica_id: Option<ReplicaId>,
     local_clock: LocalTimestamp,
@@ -39,6 +39,7 @@ pub struct FragmentId(Arc<Vec<u16>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fragment {
+    version: Arc<Version>,
     id: FragmentId,
     insertion: Insertion,
     start_offset: usize,
@@ -81,15 +82,6 @@ pub struct Insertion {
     replica_id: ReplicaId,
     text: Arc<Text>,
     timestamp: LamportTimeStamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Deletion {
-    start_id: EditId,
-    start_offset: usize,
-    end_id: EditId,
-    end_offset: usize,
-    version_in_range: Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +149,8 @@ impl Buffer {
             replica_id: 0,
             timestamp: 0,
         };
+        
+        let version = Arc::new(Version::new());
 
         fragments.push(Fragment::new(
             FragmentId::min_value(),
@@ -171,6 +165,7 @@ impl Buffer {
                 text: Arc::new(Text::new(String::new())),
                 timestamp: 0,
             },
+            version.clone(),
         ));
 
         let mut insertion_splits = HashMap::new();
@@ -183,8 +178,6 @@ impl Buffer {
             }),
         );
 
-        let version = Version::new();
-
         Self {
             id,
             replica_id: 1,
@@ -194,7 +187,7 @@ impl Buffer {
             lamport_clock: 0,
             fragments,
             insertion_splits,
-            undo_stack: vec![version],
+            undo_stack: vec![version.as_ref().clone()],
         }
     }
 
@@ -269,8 +262,10 @@ impl Buffer {
             new_text.clone(),
         );
 
-        self.version.set(self.replica_id, self.local_clock);
-        self.undo_stack.push(self.version.clone());
+        let version = unsafe { Arc::get_mut_unchecked(&mut self.version) };
+
+        version.set(self.replica_id, self.local_clock);
+        self.undo_stack.push(self.version.as_ref().clone());
 
         ops
     }
@@ -278,7 +273,9 @@ impl Buffer {
     pub fn undo(&mut self, n: usize) {
         let n = self.undo_stack.len() - 1 - n;
 
-        self.version = self.undo_stack[n].clone();
+        let version = unsafe { Arc::get_mut_unchecked(&mut self.version) };
+
+        *version = self.undo_stack[n].clone();
     }
 
     fn offset_for_point(&self, point: Point) -> Result<usize, Error> {
@@ -391,7 +388,7 @@ impl Buffer {
                 }
 
                 if let Some(mut fragment) = within_range {
-                    if version_in_range.includes(&fragment.insertion) {
+                    if version_in_range.includes(&fragment.insertion.id) {
                         fragment.deletions.insert(id);
                     }
 
@@ -414,7 +411,7 @@ impl Buffer {
 
                 let mut fragment = fragment.clone();
 
-                if version_in_range.includes(&fragment.insertion) {
+                if version_in_range.includes(&fragment.insertion.id) {
                     fragment.deletions.insert(id);
                 }
 
@@ -843,6 +840,7 @@ impl Buffer {
                 text,
                 timestamp,
             },
+            self.version.clone(),
         )
     }
 }
@@ -877,9 +875,9 @@ impl Version {
         *value = std::cmp::max(*value, insertion.id.timestamp);
     }
 
-    fn includes(&self, insertion: &Insertion) -> bool {
-        if let Some(timestamp) = self.0.get(&insertion.id.replica_id) {
-            *timestamp >= insertion.id.timestamp
+    fn includes(&self, edit: &EditId) -> bool {
+        if let Some(timestamp) = self.0.get(&edit.replica_id) {
+            *timestamp >= edit.timestamp
         } else {
             false
         }
@@ -925,7 +923,7 @@ impl<'a> Iterator for Iter<'a> {
 
     fn next(&mut self) -> Option<u8> {
         if let Some(fragment) = self.fragment_cursor.item() {
-            if self.version.includes(&fragment.insertion) {
+            if self.version.includes(&fragment.insertion.id) {
                 if let Some(c) = fragment.get_byte(self.fragment_offset) {
                     self.fragment_offset += 1;
 
@@ -938,7 +936,7 @@ impl<'a> Iterator for Iter<'a> {
             self.fragment_cursor.next();
 
             if let Some(fragment) = self.fragment_cursor.item() {
-                if self.version.includes(&fragment.insertion) {
+                if self.version.includes(&fragment.insertion.id) {
                     if let Some(c) = fragment.get_byte(0) {
                         self.fragment_offset = 1;
 
@@ -1339,10 +1337,11 @@ impl<'a> Add<&'a FragmentId> for FragmentId {
 }
 
 impl Fragment {
-    fn new(id: FragmentId, insertion: Insertion) -> Fragment {
+    fn new(id: FragmentId, insertion: Insertion, version: Arc<Version>) -> Fragment {
         let end_offset = insertion.text.len();
 
         Fragment {
+            version,
             id,
             insertion,
             start_offset: 0,
@@ -1368,7 +1367,7 @@ impl Fragment {
     }
 
     fn is_visible(&self) -> bool {
-        self.deletions.is_empty()
+        self.deletions.iter().all(|d| !self.version.includes(d))
     }
 
     fn point_for_offset(&self, offset: usize) -> Result<Point, Error> {
@@ -1603,7 +1602,6 @@ mod test {
         assert_eq!(buffer.to_string(), "hello, there worms!");
 
         buffer.undo(1);
-
-        panic!("{}", buffer.to_string());
+        assert_eq!(buffer.to_string(), "hello, there world!");
     }
 }
